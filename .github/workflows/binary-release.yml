@@ -352,9 +352,210 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+  build-pcsc-musl:
+    # 给 OpenWrt 用的 PC/SC 版。上面 build-pcsc 产出的是 glibc 动态链接的，
+    # OpenWrt 是 musl，加载器路径都对不上，装上去直接 not found。
+    # 这里改为全静态 musl：用 zig 作交叉编译器（自带各架构 musl sysroot），
+    # 并从源码编译 libpcsclite 的客户端静态库一起链进去，
+    # 于是产物不依赖目标机上的任何 libc / libpcsclite，只要求 pcscd 在跑。
+    name: 构建 ${{ matrix.artifact_arch }} (PC/SC, musl 静态)
+    needs: frontend
+    runs-on: ubuntu-latest
+    environment: Nyantenna
+    env:
+      ZIG_VERSION: '0.16.0'
+      # 与 OpenWrt packages 源里的 pcsc-lite 保持同版本
+      PCSC_VERSION: '2.5.0'
+      # 必须与 OpenWrt pcscd 的 socket 路径一致（其 Makefile 里写死 /var/run/pcscd）。
+      # 该路径在编译期写入客户端库，对不上就连不上守护进程。
+      PCSC_IPCDIR: '/var/run/pcscd'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: amd64
+            artifact_arch: amd64
+            zig_target: x86_64-linux-musl
+            cpu_family: x86_64
+          - goarch: arm64
+            artifact_arch: arm64
+            zig_target: aarch64-linux-musl
+            cpu_family: aarch64
+          - goarch: arm
+            goarm: '7'
+            artifact_arch: armv7
+            zig_target: arm-linux-musleabihf
+            cpu_family: arm
+    steps:
+      - name: 检出主仓库
+        uses: actions/checkout@v4
+        with:
+          path: nyantenna
+
+      - name: 校验 Environment secret
+        env:
+          RECON_REPO: ${{ secrets.RECON_REPO }}
+          RECON_PAT: ${{ secrets.RECON_PAT }}
+        run: |
+          : "${RECON_REPO:?为空：请确认 Nyantenna Environment 下已配置 RECON_REPO，且本 job 已声明 environment}"
+          : "${RECON_PAT:?为空：请确认 Nyantenna Environment 下已配置 RECON_PAT}"
+
+      - name: 检出 VoWiFi 重构模块（私有）
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.RECON_REPO }}
+          token: ${{ secrets.RECON_PAT }}
+          path: recon
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: nyantenna/go.mod
+          cache-dependency-path: nyantenna/go.sum
+
+      - name: 安装 zig 与 meson
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
+          sudo mkdir -p /opt/zig && sudo tar xf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+          /opt/zig/zig version
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build python3-pip
+          pipx install meson || pip3 install --break-system-packages meson
+          meson --version
+
+      # 只编客户端静态库；守护进程用 OpenWrt 自带的 pcscd，故 libusb/udev 全部关掉。
+      # buildtype=release + 关 ubsan 是必须的：zig cc 在 debug 下会插入 UBSan 检查，
+      # 而静态链接时没有对应 runtime，会以一堆 __ubsan_handle_* 未定义符号收场。
+      - name: 交叉编译 libpcsclite（静态，musl）
+        env:
+          ZIG_TARGET: ${{ matrix.zig_target }}
+          CPU_FAMILY: ${{ matrix.cpu_family }}
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://pcsclite.apdu.fr/files/pcsc-lite-${PCSC_VERSION}.tar.xz" -o /tmp/pcsc.tar.xz
+          mkdir -p /tmp/pcsc && tar xf /tmp/pcsc.tar.xz -C /tmp/pcsc --strip-components=1
+
+          cat > /tmp/cross.ini <<EOF
+          [binaries]
+          c = ['/opt/zig/zig', 'cc', '-target', '${ZIG_TARGET}']
+          cpp = ['/opt/zig/zig', 'c++', '-target', '${ZIG_TARGET}']
+          ar = ['/opt/zig/zig', 'ar']
+          ranlib = ['/opt/zig/zig', 'ranlib']
+
+          [host_machine]
+          system = 'linux'
+          cpu_family = '${CPU_FAMILY}'
+          cpu = '${CPU_FAMILY}'
+          endian = 'little'
+          EOF
+
+          cd /tmp/pcsc
+          meson setup build --cross-file /tmp/cross.ini \
+            --default-library=static --prefix=/usr --buildtype=release \
+            -Dc_args=-fno-sanitize=undefined \
+            -Dlibudev=false -Dlibsystemd=false -Dlibusb=false -Dpolkit=false \
+            -Dipcdir="${PCSC_IPCDIR}" -Dusbdropdir=/usr/lib/pcsc/drivers
+          ninja -C build libpcsclite.a
+
+          SYSROOT=/tmp/sysroot
+          mkdir -p "$SYSROOT/lib/pkgconfig" "$SYSROOT/include/PCSC"
+          cp build/libpcsclite.a "$SYSROOT/lib/"
+          cp src/PCSC/*.h "$SYSROOT/include/PCSC/" || true
+          rm -f "$SYSROOT/include/PCSC/pcsclite.h.in"
+          cp build/pcsclite.h "$SYSROOT/include/PCSC/"   # 由 meson 从 .in 生成
+          cat > "$SYSROOT/lib/pkgconfig/libpcsclite.pc" <<EOF
+          prefix=$SYSROOT
+          libdir=\${prefix}/lib
+          includedir=\${prefix}/include
+          Name: libpcsclite
+          Description: PC/SC client (static, musl)
+          Version: ${PCSC_VERSION}
+          Libs: -L\${libdir} -lpcsclite
+          Cflags: -I\${includedir}/PCSC
+          EOF
+
+          # socket 路径必须真的写进了库，否则连不上 OpenWrt 的 pcscd
+          strings "$SYSROOT/lib/libpcsclite.a" | grep -q "${PCSC_IPCDIR}/pcscd.comm"
+          echo "✓ libpcsclite.a 就绪，socket 路径 ${PCSC_IPCDIR}/pcscd.comm"
+
+      - name: 配置私有模块拉取
+        env:
+          RECON_PAT: ${{ secrets.RECON_PAT }}
+          QMI_MIRROR: ${{ env.QMI_MIRROR }}
+          NETLINK_MIRROR: ${{ env.NETLINK_MIRROR }}
+        run: |
+          go env -w GOPRIVATE='github.com/iniwex5/*'
+          go env -w GONOSUMDB='github.com/iniwex5/*'
+          git config --global \
+            url."https://x-access-token:${RECON_PAT}@github.com/${QMI_MIRROR}".insteadOf \
+            "https://github.com/iniwex5/quectel-qmi-go"
+          git config --global \
+            url."https://x-access-token:${RECON_PAT}@github.com/${NETLINK_MIRROR}".insteadOf \
+            "https://github.com/iniwex5/netlink"
+
+      - name: 接入 VoWiFi 重构模块
+        working-directory: nyantenna
+        run: |
+          go mod edit -replace github.com/iniwex5/vowifi-go=../recon
+          go mod tidy
+
+      - name: 准备版本信息
+        id: vars
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME}"
+          else
+            VERSION="${{ github.event.inputs.version || 'dev' }}"
+          fi
+          {
+            echo "version=${VERSION}"
+            echo "buildtime=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          } >> "${GITHUB_OUTPUT}"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: nyantenna/web-next/.output/public
+
+      - name: 同步前端资源以供嵌入
+        working-directory: nyantenna
+        run: |
+          rm -rf internal/web/dist
+          cp -R web-next/.output/public internal/web/dist
+
+      - name: 编译
+        working-directory: nyantenna
+        env:
+          LDFLAGS_PKG: github.com/ximineko/nyantenna/internal/global
+          ZIG_TARGET: ${{ matrix.zig_target }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          printf '#!/bin/sh\nexec /opt/zig/zig cc -target %s "$@"\n' "${ZIG_TARGET}" > /tmp/cc.sh
+          chmod +x /tmp/cc.sh
+          OUT="out/nyantenna_${{ steps.vars.outputs.version }}_linux_${{ matrix.artifact_arch }}_pcsc_musl"
+          CGO_ENABLED=1 GOOS=linux GOARCH="${{ matrix.goarch }}" GOARM="${{ matrix.goarm }}" \
+            CC=/tmp/cc.sh PKG_CONFIG_LIBDIR=/tmp/sysroot/lib/pkgconfig \
+            go build -trimpath -buildvcs=false -tags "with_utls nomsgpack pcsc" \
+            -ldflags "-s -w -extldflags '-static' -X '${LDFLAGS_PKG}.Version=${{ steps.vars.outputs.version }}+pcsc-musl' -X '${LDFLAGS_PKG}.BuildTime=${{ steps.vars.outputs.buildtime }}'" \
+            -o "$OUT" ./cmd/nyantenna
+
+          file "$OUT"
+          # 必须零动态依赖，否则在 OpenWrt 上照样起不来
+          test "$(readelf -d "$OUT" 2>/dev/null | grep -c NEEDED)" -eq 0
+          strings "$OUT" | grep -q "${PCSC_IPCDIR}/pcscd.comm"
+          echo "✓ 全静态，且内嵌 socket 路径正确"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.artifact_arch }}-pcsc-musl
+          path: nyantenna/out/*
+          if-no-files-found: error
+          retention-days: 3
+
   release:
     name: 发布 Release
-    needs: [build, build-pcsc]
+    needs: [build, build-pcsc, build-pcsc-musl]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
@@ -380,6 +581,7 @@ jobs:
             | 文件 | 说明 |
             | --- | --- |
             | `*_linux_amd64` / `arm64` / `armv7` | 静态构建，不含 PC/SC 读卡器支持 |
-            | `*_linux_{amd64,arm64,armv7}_pcsc` | 含 PC/SC 支持；动态链接 `libpcsclite`，需宿主已装 `pcscd` 与 CCID 驱动 |
+            | `*_pcsc` | 含 PC/SC 支持，glibc 动态链接。适用于常规发行版（Debian/Ubuntu 等），需宿主已装 `pcscd` 与 CCID 驱动 |
+            | `*_pcsc_musl` | 含 PC/SC 支持，**全静态 musl**。适用于 OpenWrt 等 musl 系统；仍需目标机运行 `pcscd` 并装 CCID 驱动 |
 
             校验：`sha256sum -c SHA256SUMS`
