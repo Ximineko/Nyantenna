@@ -1,0 +1,38 @@
+name: Web CI
+
+on:
+  pull_request:
+    paths:
+      - 'web-next/**'
+      - '.github/workflows/web-ci.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'web-next/**'
+      - '.github/workflows/web-ci.yml'
+  workflow_dispatch:
+
+jobs:
+  web-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: web-next/package-lock.json
+
+      # 用 install 而非 ci：lockfile 与 package.json 存在版本不一致，
+      # npm ci 会以 EUSAGE 直接失败。
+      - name: Install dependencies
+        run: npm install --prefix web-next --no-audit --no-fund
+
+      # 未跑 lint/typecheck：web-next 没有 lint 脚本，
+      # 且 nuxt typecheck 在本仓库因缺少根 tsconfig 无法运行。
+      - name: Build
+        run: npm run generate --prefix web-next
