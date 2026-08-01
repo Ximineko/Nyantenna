@@ -182,10 +182,30 @@ jobs:
           retention-days: 3
 
   build-pcsc:
-    name: 构建 amd64 (PC/SC)
+    # PC/SC 需要 cgo。统一在 x86 runner 上交叉编译：
+    # 通过 dpkg multiarch 装目标架构的 libpcsclite，再指定交叉 gcc 与 pkg-config 路径。
+    name: 构建 ${{ matrix.artifact_arch }} (PC/SC)
     needs: frontend
     runs-on: ubuntu-latest
     environment: Nyantenna
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # amd64 为原生构建，不需要 triplet / 交叉 gcc
+          - goarch: amd64
+            artifact_arch: amd64
+          - goarch: arm64
+            artifact_arch: arm64
+            deb_arch: arm64
+            triplet: aarch64-linux-gnu
+            cross_pkg: gcc-aarch64-linux-gnu
+          - goarch: arm
+            goarm: '7'
+            artifact_arch: armv7
+            deb_arch: armhf
+            triplet: arm-linux-gnueabihf
+            cross_pkg: gcc-arm-linux-gnueabihf
     steps:
       - name: 检出主仓库
         uses: actions/checkout@v4
@@ -213,10 +233,50 @@ jobs:
           go-version-file: nyantenna/go.mod
           cache-dependency-path: nyantenna/go.sum
 
+      # ebfe/scard 用 `#cgo pkg-config: libpcsclite` 链接，交叉编译时必须装上
+      # 目标架构的 libpcsclite 开发包，并把 pkg-config 指向该架构的 .pc 目录。
       - name: 安装 PC/SC 开发库
+        env:
+          DEB_ARCH: ${{ matrix.deb_arch }}
+          TRIPLET: ${{ matrix.triplet }}
+          CROSS_PKG: ${{ matrix.cross_pkg }}
         run: |
+          set -euo pipefail
+          if [ -z "${TRIPLET}" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq libpcsclite-dev
+            exit 0
+          fi
+
+          sudo dpkg --add-architecture "${DEB_ARCH}"
+
+          # 所有既有源都必须限定 amd64。archive.ubuntu.com 不含 arm 包，
+          # runner 镜像自带的第三方源（microsoft / docker / gh-cli 等）同样只有 amd64；
+          # 不限定的话 apt update 会对每个 arm 索引报 404，整条命令随之失败。
+          for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+            [ -e "$f" ] || continue
+            sudo sed -i -E 's|^deb +(\[[^]]*\] *)?|deb [arch=amd64] |' "$f"
+          done
+          for f in /etc/apt/sources.list.d/*.sources; do
+            [ -e "$f" ] || continue
+            grep -q '^Architectures:' "$f" || sudo sed -i '/^Types: deb/a Architectures: amd64' "$f"
+          done
+
+          # arm 包在 ports.ubuntu.com
+          CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME}")"
+          sudo tee "/etc/apt/sources.list.d/ports-${DEB_ARCH}.sources" >/dev/null <<EOF
+          Types: deb
+          URIs: http://ports.ubuntu.com/ubuntu-ports
+          Suites: ${CODENAME} ${CODENAME}-updates ${CODENAME}-security
+          Components: main universe
+          Architectures: ${DEB_ARCH}
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          EOF
+
           sudo apt-get update -qq
-          sudo apt-get install -y -qq libpcsclite-dev
+          sudo apt-get install -y -qq "${CROSS_PKG}" "libpcsclite-dev:${DEB_ARCH}"
+          test -f "/usr/lib/${TRIPLET}/pkgconfig/libpcsclite.pc"
+          echo "✓ ${DEB_ARCH} 的 libpcsclite 与 ${CROSS_PKG} 已就位"
 
       - name: 配置私有模块拉取
         env:
@@ -268,16 +328,26 @@ jobs:
         working-directory: nyantenna
         env:
           LDFLAGS_PKG: github.com/ximineko/nyantenna/internal/global
+          TRIPLET: ${{ matrix.triplet }}
         run: |
+          set -euo pipefail
           mkdir -p out
-          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
-            go build -trimpath -buildvcs=false -tags "with_utls nomsgpack pcsc" \
+          export CGO_ENABLED=1 GOOS=linux
+          export GOARCH="${{ matrix.goarch }}" GOARM="${{ matrix.goarm }}"
+          if [ -n "${TRIPLET}" ]; then
+            export CC="${TRIPLET}-gcc"
+            # 用 LIBDIR 而非 PATH：前者会替换默认搜索路径，
+            # 避免 pkg-config 回落到宿主 amd64 的 .pc 而链出错架构的库。
+            export PKG_CONFIG_LIBDIR="/usr/lib/${TRIPLET}/pkgconfig"
+          fi
+          go build -trimpath -buildvcs=false -tags "with_utls nomsgpack pcsc" \
             -ldflags "-s -w -X '${LDFLAGS_PKG}.Version=${{ steps.vars.outputs.version }}+pcsc' -X '${LDFLAGS_PKG}.BuildTime=${{ steps.vars.outputs.buildtime }}'" \
-            -o "out/nyantenna_${{ steps.vars.outputs.version }}_linux_amd64_pcsc" ./cmd/nyantenna
+            -o "out/nyantenna_${{ steps.vars.outputs.version }}_linux_${{ matrix.artifact_arch }}_pcsc" ./cmd/nyantenna
+          file "out/nyantenna_${{ steps.vars.outputs.version }}_linux_${{ matrix.artifact_arch }}_pcsc"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: binaries-amd64-pcsc
+          name: binaries-${{ matrix.artifact_arch }}-pcsc
           path: nyantenna/out/*
           if-no-files-found: error
           retention-days: 3
@@ -310,6 +380,6 @@ jobs:
             | 文件 | 说明 |
             | --- | --- |
             | `*_linux_amd64` / `arm64` / `armv7` | 静态构建，不含 PC/SC 读卡器支持 |
-            | `*_linux_amd64_pcsc` | 含 PC/SC 支持，需宿主已装 `pcscd` 与 CCID 驱动 |
+            | `*_linux_{amd64,arm64,armv7}_pcsc` | 含 PC/SC 支持；动态链接 `libpcsclite`，需宿主已装 `pcscd` 与 CCID 驱动 |
 
             校验：`sha256sum -c SHA256SUMS`
