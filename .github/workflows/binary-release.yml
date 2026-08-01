@@ -7,11 +7,11 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version string (used when manually triggered)'
+        description: '版本号（手动触发时使用）'
         required: false
         default: 'dev'
       enable_upx:
-        description: 'Enable UPX compression (true/false)'
+        description: '是否用 UPX 压缩 (true/false)'
         required: false
         default: 'true'
 
@@ -22,29 +22,30 @@ concurrency:
   group: binary-release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  QMI_MIRROR: ximineko/quectel-qmi-go
+  NETLINK_MIRROR: ximineko/netlink
+
 jobs:
   frontend:
-    name: Build frontend assets
+    name: 构建前端资源
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: 'npm'
           cache-dependency-path: web-next/package-lock.json
 
-      - name: Build frontend assets
-        shell: bash
+      # 用 install 而非 ci：lockfile 与 package.json 存在版本不一致，npm ci 会以 EUSAGE 失败
+      - name: 安装依赖并构建
         run: |
           npm install --prefix web-next --no-audit --no-fund
           npm run generate --prefix web-next
 
-      - name: Upload frontend dist
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: web-dist
           path: web-next/.output/public
@@ -52,244 +53,263 @@ jobs:
           retention-days: 1
 
   build:
-    name: Build ${{ matrix.artifact_arch }}
-    runs-on: ubuntu-latest
+    name: 构建 ${{ matrix.artifact_arch }}
     needs: frontend
+    runs-on: ubuntu-latest
+    # RECON_PAT / RECON_REPO 存放在名为 Nyantenna 的 Environment 下，
+    # 不声明 environment 的话这两个 secret 会解析成空串（且不会报错）。
+    environment: Nyantenna
     strategy:
       fail-fast: false
       matrix:
         include:
           - goarch: amd64
-            goarm: ''
             artifact_arch: amd64
           - goarch: arm64
-            goarm: ''
             artifact_arch: arm64
           - goarch: arm
             goarm: '7'
             artifact_arch: armv7
-
     steps:
-      - name: Checkout
+      - name: 检出主仓库
         uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
-          cache: true
+          path: nyantenna
 
-      - name: Configure Git for private modules
+      - name: 校验 Environment secret
         env:
-          GH_PAT: ${{ secrets.GH_PAT }}
+          RECON_REPO: ${{ secrets.RECON_REPO }}
+          RECON_PAT: ${{ secrets.RECON_PAT }}
         run: |
-          if [ -n "${GH_PAT}" ]; then
-            git config --global url."https://x-access-token:${GH_PAT}@github.com/iniwex5/".insteadOf "https://github.com/iniwex5/"
-            go env -w GOPRIVATE=github.com/iniwex5/*
-          fi
+          : "${RECON_REPO:?为空：请确认 Nyantenna Environment 下已配置 RECON_REPO，且本 job 已声明 environment}"
+          : "${RECON_PAT:?为空：请确认 Nyantenna Environment 下已配置 RECON_PAT}"
+          echo "✓ Environment secret 已就位"
 
-      - name: Prepare build vars
-        id: vars
-        shell: bash
+      - name: 检出 VoWiFi 重构模块（私有）
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.RECON_REPO }}
+          token: ${{ secrets.RECON_PAT }}
+          path: recon
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: nyantenna/go.mod
+          cache-dependency-path: nyantenna/go.sum
+
+      - name: 配置私有模块拉取
+        env:
+          RECON_PAT: ${{ secrets.RECON_PAT }}
+          QMI_MIRROR: ${{ env.QMI_MIRROR }}
+          NETLINK_MIRROR: ${{ env.NETLINK_MIRROR }}
         run: |
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+          go env -w GOPRIVATE='github.com/iniwex5/*'
+          go env -w GONOSUMDB='github.com/iniwex5/*'
+          git config --global \
+            url."https://x-access-token:${RECON_PAT}@github.com/${QMI_MIRROR}".insteadOf \
+            "https://github.com/iniwex5/quectel-qmi-go"
+          git config --global \
+            url."https://x-access-token:${RECON_PAT}@github.com/${NETLINK_MIRROR}".insteadOf \
+            "https://github.com/iniwex5/netlink"
+
+      - name: 接入 VoWiFi 重构模块
+        working-directory: nyantenna
+        run: |
+          go mod edit -replace github.com/iniwex5/vowifi-go=../recon
+          go mod tidy
+          go list -m github.com/iniwex5/vowifi-go
+
+      - name: 准备版本信息
+        id: vars
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             VERSION="${GITHUB_REF_NAME}"
           else
             VERSION="${{ github.event.inputs.version || 'dev' }}"
           fi
-          BUILDTIME="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          REVISION="${GITHUB_SHA}"
-
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            ENABLE_UPX_RAW="${{ github.event.inputs.enable_upx }}"
-          else
-            ENABLE_UPX_RAW="true"
-          fi
-
-          case "${ENABLE_UPX_RAW}" in
+          case "${{ github.event.inputs.enable_upx || 'true' }}" in
             false|0|no|off) ENABLE_UPX=0 ;;
             *) ENABLE_UPX=1 ;;
           esac
+          {
+            echo "version=${VERSION}"
+            echo "buildtime=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "enable_upx=${ENABLE_UPX}"
+          } >> "${GITHUB_OUTPUT}"
 
-          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
-          echo "buildtime=${BUILDTIME}" >> "${GITHUB_OUTPUT}"
-          echo "revision=${REVISION}" >> "${GITHUB_OUTPUT}"
-          echo "enable_upx=${ENABLE_UPX}" >> "${GITHUB_OUTPUT}"
-
-      - name: Download frontend dist
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: web-dist
-          path: web-next/.output/public
+          path: nyantenna/web-next/.output/public
 
-      - name: Sync frontend dist for embed
-        shell: bash
+      # internal/web 用 //go:embed all:dist 嵌入，必须在 go build 之前就位
+      - name: 同步前端资源以供嵌入
+        working-directory: nyantenna
         run: |
           rm -rf internal/web/dist
           cp -R web-next/.output/public internal/web/dist
 
-      - name: Build binary
-        shell: bash
+      - name: 编译
+        working-directory: nyantenna
+        env:
+          LDFLAGS_PKG: github.com/ximineko/nyantenna/internal/global
         run: |
           mkdir -p dist
           CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.goarch }} GOARM=${{ matrix.goarm }} \
-            go build -trimpath -buildvcs=false -tags "with_utls" \
-            -ldflags "-s -w -X 'github.com/ximineko/nyantenna/internal/global.Version=${{ steps.vars.outputs.version }}' -X 'github.com/ximineko/nyantenna/internal/global.BuildTime=${{ steps.vars.outputs.buildtime }}'" \
+            go build -trimpath -buildvcs=false -tags "with_utls nomsgpack" \
+            -ldflags "-s -w -X '${LDFLAGS_PKG}.Version=${{ steps.vars.outputs.version }}' -X '${LDFLAGS_PKG}.BuildTime=${{ steps.vars.outputs.buildtime }}'" \
             -o dist/nyantenna ./cmd/nyantenna
 
-      - name: Install UPX
-        if: ${{ steps.vars.outputs.enable_upx == '1' }}
-        shell: bash
+      - name: UPX 压缩
+        if: steps.vars.outputs.enable_upx == '1'
+        working-directory: nyantenna
         run: |
-          sudo apt-get update
-          sudo apt-get install -y upx-ucl || sudo apt-get install -y upx
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq upx-ucl || sudo apt-get install -y -qq upx
+          upx --best --lzma dist/nyantenna || upx -9 dist/nyantenna || echo "UPX 失败，保留未压缩产物"
 
-      - name: Compress with UPX
-        if: ${{ steps.vars.outputs.enable_upx == '1' }}
-        shell: bash
+      - name: 重命名产物
+        working-directory: nyantenna
         run: |
-          upx --best --lzma dist/nyantenna || upx -9 dist/nyantenna
-
-      - name: Package artifacts
-        shell: bash
-        run: |
-          OUT="nyantenna_${{ steps.vars.outputs.version }}_linux_${{ matrix.artifact_arch }}"
           mkdir -p out
-          cp dist/nyantenna "out/${OUT}"
+          cp dist/nyantenna "out/nyantenna_${{ steps.vars.outputs.version }}_linux_${{ matrix.artifact_arch }}"
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: binaries-${{ matrix.artifact_arch }}
-          path: out/*
+          path: nyantenna/out/*
+          if-no-files-found: error
+          retention-days: 3
+
+  build-pcsc:
+    name: 构建 amd64 (PC/SC)
+    needs: frontend
+    runs-on: ubuntu-latest
+    environment: Nyantenna
+    steps:
+      - name: 检出主仓库
+        uses: actions/checkout@v4
+        with:
+          path: nyantenna
+
+      - name: 校验 Environment secret
+        env:
+          RECON_REPO: ${{ secrets.RECON_REPO }}
+          RECON_PAT: ${{ secrets.RECON_PAT }}
+        run: |
+          : "${RECON_REPO:?为空：请确认 Nyantenna Environment 下已配置 RECON_REPO，且本 job 已声明 environment}"
+          : "${RECON_PAT:?为空：请确认 Nyantenna Environment 下已配置 RECON_PAT}"
+          echo "✓ Environment secret 已就位"
+
+      - name: 检出 VoWiFi 重构模块（私有）
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.RECON_REPO }}
+          token: ${{ secrets.RECON_PAT }}
+          path: recon
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: nyantenna/go.mod
+          cache-dependency-path: nyantenna/go.sum
+
+      - name: 安装 PC/SC 开发库
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libpcsclite-dev
+
+      - name: 配置私有模块拉取
+        env:
+          RECON_PAT: ${{ secrets.RECON_PAT }}
+          QMI_MIRROR: ${{ env.QMI_MIRROR }}
+          NETLINK_MIRROR: ${{ env.NETLINK_MIRROR }}
+        run: |
+          go env -w GOPRIVATE='github.com/iniwex5/*'
+          go env -w GONOSUMDB='github.com/iniwex5/*'
+          git config --global \
+            url."https://x-access-token:${RECON_PAT}@github.com/${QMI_MIRROR}".insteadOf \
+            "https://github.com/iniwex5/quectel-qmi-go"
+          git config --global \
+            url."https://x-access-token:${RECON_PAT}@github.com/${NETLINK_MIRROR}".insteadOf \
+            "https://github.com/iniwex5/netlink"
+
+      - name: 接入 VoWiFi 重构模块
+        working-directory: nyantenna
+        run: |
+          go mod edit -replace github.com/iniwex5/vowifi-go=../recon
+          go mod tidy
+
+      - name: 准备版本信息
+        id: vars
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME}"
+          else
+            VERSION="${{ github.event.inputs.version || 'dev' }}"
+          fi
+          {
+            echo "version=${VERSION}"
+            echo "buildtime=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          } >> "${GITHUB_OUTPUT}"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: nyantenna/web-next/.output/public
+
+      - name: 同步前端资源以供嵌入
+        working-directory: nyantenna
+        run: |
+          rm -rf internal/web/dist
+          cp -R web-next/.output/public internal/web/dist
+
+      # 不做 UPX：cgo 动态链接的产物压缩后容易起不来
+      - name: 编译
+        working-directory: nyantenna
+        env:
+          LDFLAGS_PKG: github.com/ximineko/nyantenna/internal/global
+        run: |
+          mkdir -p out
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -buildvcs=false -tags "with_utls nomsgpack pcsc" \
+            -ldflags "-s -w -X '${LDFLAGS_PKG}.Version=${{ steps.vars.outputs.version }}+pcsc' -X '${LDFLAGS_PKG}.BuildTime=${{ steps.vars.outputs.buildtime }}'" \
+            -o "out/nyantenna_${{ steps.vars.outputs.version }}_linux_amd64_pcsc" ./cmd/nyantenna
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-amd64-pcsc
+          path: nyantenna/out/*
+          if-no-files-found: error
           retention-days: 3
 
   release:
-    name: Publish Release Assets
+    name: 发布 Release
+    needs: [build, build-pcsc]
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    needs: build
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
-    env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
-
     steps:
-      - name: Prepare release vars
-        id: release_vars
-        shell: bash
-        run: |
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            RELEASE_VERSION="${GITHUB_REF_NAME}"
-          else
-            RELEASE_VERSION="${{ github.event.inputs.version || 'dev' }}"
-          fi
-          echo "release_version=${RELEASE_VERSION}" >> "${GITHUB_OUTPUT}"
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           pattern: binaries-*
-          merge-multiple: true
           path: dist
+          merge-multiple: true
 
-      - name: Publish to GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.release_vars.outputs.release_version }}
-
-      - name: Load source release metadata
-        id: source_release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
+      - name: 生成校验和
         run: |
-          set -euo pipefail
-          RELEASE_API="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${{ steps.release_vars.outputs.release_version }}"
+          cd dist
+          sha256sum * > SHA256SUMS
+          ls -la
 
-          release_json="$(curl -fsSL \
-            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "${RELEASE_API}")"
-
-          release_name="$(printf '%s' "${release_json}" | jq -r '.name // ""')"
-          release_body="$(printf '%s' "${release_json}" | jq -r '.body // ""')"
-
-          {
-            echo "release_name<<EOF"
-            printf '%s\n' "${release_name}"
-            echo "EOF"
-            echo "release_body<<EOF"
-            printf '%s\n' "${release_body}"
-            echo "EOF"
-          } >> "${GITHUB_OUTPUT}"
-
-      - name: Validate token for cross-repo publish
-        shell: bash
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
-        run: |
-          if [[ -z "${GH_PAT}" ]]; then
-            echo "GH_PAT is required to publish assets to iniwex5/vohive-release"
-            exit 1
-          fi
-
-      - name: Publish to nyantenna-release repository
-        uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v2
         with:
-          repository: iniwex5/vohive-release
-          token: ${{ secrets.GH_PAT }}
-          tag_name: ${{ steps.release_vars.outputs.release_version }}
-          name: ${{ steps.source_release.outputs.release_name }}
-          body: ${{ steps.source_release.outputs.release_body }}
           files: dist/*
-          fail_on_unmatched_files: true
-          overwrite_files: true
+          generate_release_notes: true
+          body: |
+            ## 产物说明
 
-      - name: Upload assets to Telegram channel
-        if: ${{ env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHANNEL_ID != '' }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_BODY: ${{ steps.source_release.outputs.release_body }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          API="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}"
+            | 文件 | 说明 |
+            | --- | --- |
+            | `*_linux_amd64` / `arm64` / `armv7` | 静态构建，不含 PC/SC 读卡器支持 |
+            | `*_linux_amd64_pcsc` | 含 PC/SC 支持，需宿主已装 `pcscd` 与 CCID 驱动 |
 
-          MESSAGE_HEADER="nyantenna release ${{ steps.release_vars.outputs.release_version }} assets"
-          if [[ -n "${RELEASE_BODY}" ]]; then
-            FULL_MESSAGE="${MESSAGE_HEADER}"$'\n\n'"Release notes:"$'\n'"${RELEASE_BODY}"
-          else
-            FULL_MESSAGE="${MESSAGE_HEADER}"
-          fi
-
-          shopt -s nullglob
-          FILES=(dist/*)
-
-          if [[ ${#FILES[@]} -eq 0 ]]; then
-            MESSAGE="${FULL_MESSAGE:0:3800}"
-            curl -fsSL -X POST "${API}/sendMessage" \
-              -d "chat_id=${TELEGRAM_CHANNEL_ID}" \
-              --data-urlencode "text=${MESSAGE}"
-            exit 0
-          fi
-
-          # sendMediaGroup 里首个文档携带说明；caption 上限 1024。
-          CAPTION="${FULL_MESSAGE:0:1000}"
-          CAPTION_JSON="$(jq -Rn --arg s "${CAPTION}" '$s')"
-
-          MEDIA_ITEMS=()
-          for i in "${!FILES[@]}"; do
-            if [[ "${i}" -eq 0 ]]; then
-              MEDIA_ITEMS+=("{\"type\":\"document\",\"media\":\"attach://file${i}\",\"caption\":${CAPTION_JSON}}")
-            else
-              MEDIA_ITEMS+=("{\"type\":\"document\",\"media\":\"attach://file${i}\"}")
-            fi
-          done
-          MEDIA_JSON="[$(IFS=,; echo "${MEDIA_ITEMS[*]}")]"
-
-          echo "Uploading ${#FILES[@]} binary file(s) to Telegram as one media group..."
-          CURL_ARGS=(-fsSL -X POST "${API}/sendMediaGroup" -F "chat_id=${TELEGRAM_CHANNEL_ID}" -F "media=${MEDIA_JSON}")
-          for i in "${!FILES[@]}"; do
-            CURL_ARGS+=(-F "file${i}=@${FILES[$i]}")
-          done
-          curl "${CURL_ARGS[@]}"
+            校验：`sha256sum -c SHA256SUMS`
