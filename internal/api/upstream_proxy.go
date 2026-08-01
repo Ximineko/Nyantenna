@@ -1,6 +1,9 @@
 package api
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -9,6 +12,17 @@ import (
 	"github.com/ximineko/nyantenna/internal/db"
 	"github.com/ximineko/nyantenna/internal/upstreamproxy"
 )
+
+// newUpstreamProxyID 生成前置代理的主键。
+// ID 对使用者没有语义（界面上展示的是 name，规则下拉也回落到 name），
+// 因此不要求调用方提供——前端表单里本就没有这个字段。
+func newUpstreamProxyID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err == nil {
+		return "up_" + hex.EncodeToString(b)
+	}
+	return fmt.Sprintf("up_%d", time.Now().UnixNano())
+}
 
 // ── 前置代理管理 API（主服务） ──
 
@@ -61,8 +75,7 @@ func (s *Server) handleCreateUpstreamProxy(c *gin.Context) {
 	}
 	req = normalizeUpstreamProxyPayload(nil, req)
 	if req.ID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "id 不能为空"})
-		return
+		req.ID = newUpstreamProxyID()
 	}
 	if req.Addr == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "addr 不能为空"})
@@ -84,6 +97,7 @@ func (s *Server) handleCreateUpstreamProxy(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"status":  "ok",
 		"message": "前置代理已保存，并已通过探测",
+		"id":      req.ID, // ID 可能是服务端生成的，回传给调用方
 		"result":  result,
 	})
 }
