@@ -286,7 +286,10 @@ func resolveVoWiFiCountryProxy(homeMCC, traceID, deviceID string) *runtimehost.P
 		return nil
 	}
 	if proxy == nil {
-		logger.Debug("VoWiFi 国家前置代理未命中，使用直连",
+		// 用 Info 而非 Debug：回落直连会实质改变出口路径，
+		// 对需要特定地区 IP 才能接入 ePDG 的场景是致命的，
+		// 且失败表现为 IKE 超时，从现象根本看不出走了直连。
+		logger.Info("VoWiFi 国家前置代理未命中，使用直连",
 			"trace_id", traceID,
 			"device", deviceID,
 			"home_mcc", strings.TrimSpace(homeMCC),

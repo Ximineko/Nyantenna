@@ -242,13 +242,21 @@ func (s *Server) handleUpsertUpstreamProxyCountryRule(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "国家代码不在 MCC/MNC 表中"})
 		return
 	}
+	// Enabled 用指针以区分「显式传 false」与「未提供」。
+	// 前端的添加表单只发 upstream_proxy_id，若按布尔零值处理，
+	// 规则会以停用状态入库——界面上看着已配好，实际匹配不到，
+	// VoWiFi 静默回落直连，表现为 IKE 超时，极难定位。
 	var req struct {
 		UpstreamProxyID string `json:"upstream_proxy_id"`
-		Enabled         bool   `json:"enabled"`
+		Enabled         *bool  `json:"enabled"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "参数解析失败: " + err.Error()})
 		return
+	}
+	enabled := true
+	if req.Enabled != nil {
+		enabled = *req.Enabled
 	}
 	proxy, err := db.GetUpstreamProxyByID(req.UpstreamProxyID)
 	if err != nil {
@@ -262,7 +270,7 @@ func (s *Server) handleUpsertUpstreamProxyCountryRule(c *gin.Context) {
 	rule := db.UpstreamProxyCountryRule{
 		CountryCode:     countryCode,
 		UpstreamProxyID: proxy.ID,
-		Enabled:         req.Enabled,
+		Enabled:         enabled,
 	}
 	if err := db.UpsertUpstreamProxyCountryRule(rule); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": err.Error()})
