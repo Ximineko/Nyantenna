@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { storeToRefs } from 'pinia'
 import { useSettingsStore } from '~/stores/settings'
-import { systemService, type UpdateInfo } from '~/services/system'
+import { systemService } from '~/services/system'
 
 const settings = useSettingsStore()
 const toast = useToast()
@@ -63,34 +63,6 @@ async function changePassword() {
   }
   toast.add({ title: '密码已修改', color: 'success' })
   settings.resetPasswordForm()
-}
-
-/* 系统更新 */
-const update = ref<UpdateInfo | null>(null)
-const checkingUpdate = ref(false)
-const applyingUpdate = ref(false)
-
-async function checkUpdate() {
-  checkingUpdate.value = true
-  const result = await systemService.checkUpdate()
-  checkingUpdate.value = false
-  if (result.ok === false) {
-    toast.add({ title: '检查更新失败', description: String(result.error?.message ?? ''), color: 'error' })
-    return
-  }
-  update.value = result.data
-  if (!result.data.has_update) {
-    toast.add({ title: '已是最新版本', color: 'success' })
-  }
-}
-
-async function applyUpdate() {
-  applyingUpdate.value = true
-  const result = await systemService.applyUpdate()
-  applyingUpdate.value = false
-  toast.add(result.ok === false
-    ? { title: '更新失败', description: String(result.error?.message ?? ''), color: 'error' }
-    : { title: '更新已开始', description: result.data?.message || '服务将在完成后自动重启', color: 'success' })
 }
 
 const infoItems = computed(() => [
@@ -174,61 +146,6 @@ onMounted(() => {
         <EmptyState icon="i-lucide-info" title="暂无系统信息" />
       </div>
 
-      <!-- 更新 -->
-      <section class="mt-6">
-        <div class="flex items-center justify-between gap-4 mb-3">
-          <h2 class="text-sm font-semibold">版本更新</h2>
-          <UButton
-            icon="i-lucide-search"
-            color="neutral"
-            variant="outline"
-            size="sm"
-            label="检查更新"
-            :loading="checkingUpdate"
-            @click="checkUpdate"
-          />
-        </div>
-
-        <div class="tile px-4 py-3">
-          <div v-if="!update" class="text-sm text-muted">
-            点击「检查更新」获取最新版本信息
-          </div>
-
-          <template v-else-if="update.has_update">
-            <div class="flex flex-wrap items-center gap-2">
-              <UBadge color="primary" variant="subtle" :label="`新版本 ${update.latest_version}`" />
-              <span class="text-xs text-muted">当前 {{ update.current_version }}</span>
-            </div>
-            <p
-              v-if="update.release_note"
-              class="mt-2 text-sm text-muted whitespace-pre-wrap break-words"
-            >{{ update.release_note }}</p>
-
-            <UAlert
-              v-if="update.is_docker"
-              class="mt-3"
-              color="warning"
-              variant="subtle"
-              icon="i-lucide-container"
-              title="容器环境不支持热替换"
-              description="请拉取最新镜像并重启容器完成升级。"
-            />
-            <UButton
-              v-else
-              class="mt-3"
-              icon="i-lucide-download"
-              label="立即更新"
-              :loading="applyingUpdate"
-              @click="applyUpdate"
-            />
-          </template>
-
-          <div v-else class="flex items-center gap-2 text-sm">
-            <UIcon name="i-lucide-circle-check" class="size-4 text-success" />
-            <span>已是最新版本（{{ update.current_version }}）</span>
-          </div>
-        </div>
-      </section>
     </div>
 
     <!-- 通知 -->
