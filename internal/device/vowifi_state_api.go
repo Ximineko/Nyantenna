@@ -38,15 +38,21 @@ func (p *Pool) SendVoWiFiSMSWithResult(ctx context.Context, deviceID, to, text s
 	return p.SendVoWiFiSMSWithOptions(ctx, deviceID, to, text, smscodec.SubmitOptions{})
 }
 
+// 以下几个方法一律调用 Instance 自身的方法，不要改回 inst.Service()。
+//
+// runtimehost 的 Instance 有两条构造路径：旧的兼容路径在构造时就把服务写进
+// Instance.service，而我们实际使用的 StartModeMain 走 core 路径，服务是在
+// ipsec_up 事件里挂到 Instance.core 上的，Instance.service 始终为 nil。
+// 于是 inst.Service() 恒返回 nil，会把注册完好的链路误判成“IMS 服务未就绪”，
+// 发短信与 USSD 全部发不出去（收短信不经此路径，所以看起来只有发的方向坏了）。
+// Instance 上的方法会先取 core 适配器、再回退 Service()，两条路径都正确。
+
 func (p *Pool) SendVoWiFiSMSWithOptions(ctx context.Context, deviceID, to, text string, opts smscodec.SubmitOptions) (messaging.SendOutcome, error) {
-	if inst := p.voWiFiHost().Instance(deviceID); inst != nil {
-		svc := inst.Service()
-		if svc == nil {
-			return messaging.SendOutcome{}, fmt.Errorf("设备 %s 的 VoWiFi IMS 服务未就绪", deviceID)
-		}
-		return svc.SendSMSWithOptions(ctx, to, text, messaging.SendOptions{Encoding: string(opts.Encoding)})
+	inst := p.voWiFiHost().Instance(deviceID)
+	if inst == nil {
+		return messaging.SendOutcome{}, fmt.Errorf("设备 %s 的 VoWiFi 未启动", deviceID)
 	}
-	return messaging.SendOutcome{}, fmt.Errorf("设备 %s 的 VoWiFi 未启动", deviceID)
+	return inst.SendSMSWithOptions(ctx, to, text, messaging.SendOptions{Encoding: string(opts.Encoding)})
 }
 
 func (p *Pool) IsVoWiFiActive(deviceID string) bool {
@@ -55,38 +61,29 @@ func (p *Pool) IsVoWiFiActive(deviceID string) bool {
 
 // SendVoWiFiUSSD 通过 VoWiFi 发送 USSD 请求（首轮）。
 func (p *Pool) SendVoWiFiUSSD(ctx context.Context, deviceID, command string) (*messaging.USSDResult, error) {
-	if inst := p.voWiFiHost().Instance(deviceID); inst != nil {
-		svc := inst.Service()
-		if svc == nil {
-			return nil, fmt.Errorf("设备 %s 的 VoWiFi IMS 服务未就绪", deviceID)
-		}
-		return svc.SendUSSD(ctx, command)
+	inst := p.voWiFiHost().Instance(deviceID)
+	if inst == nil {
+		return nil, fmt.Errorf("设备 %s 的 VoWiFi 未启动", deviceID)
 	}
-	return nil, fmt.Errorf("设备 %s 的 VoWiFi 未启动", deviceID)
+	return inst.SendUSSD(ctx, command)
 }
 
 // ContinueVoWiFiUSSD 在已有 VoWiFi USSD 会话中发送后续输入。
 func (p *Pool) ContinueVoWiFiUSSD(ctx context.Context, deviceID, sessionID, input string) (*messaging.USSDResult, error) {
-	if inst := p.voWiFiHost().Instance(deviceID); inst != nil {
-		svc := inst.Service()
-		if svc == nil {
-			return nil, fmt.Errorf("设备 %s 的 VoWiFi IMS 服务未就绪", deviceID)
-		}
-		return svc.ContinueUSSD(ctx, sessionID, input)
+	inst := p.voWiFiHost().Instance(deviceID)
+	if inst == nil {
+		return nil, fmt.Errorf("设备 %s 的 VoWiFi 未启动", deviceID)
 	}
-	return nil, fmt.Errorf("设备 %s 的 VoWiFi 未启动", deviceID)
+	return inst.ContinueUSSD(ctx, sessionID, input)
 }
 
 // CancelVoWiFiUSSD 取消 VoWiFi USSD 会话。
 func (p *Pool) CancelVoWiFiUSSD(ctx context.Context, deviceID, sessionID string) error {
-	if inst := p.voWiFiHost().Instance(deviceID); inst != nil {
-		svc := inst.Service()
-		if svc == nil {
-			return fmt.Errorf("设备 %s 的 VoWiFi IMS 服务未就绪", deviceID)
-		}
-		return svc.CancelUSSD(ctx, sessionID)
+	inst := p.voWiFiHost().Instance(deviceID)
+	if inst == nil {
+		return fmt.Errorf("设备 %s 的 VoWiFi 未启动", deviceID)
 	}
-	return fmt.Errorf("设备 %s 的 VoWiFi 未启动", deviceID)
+	return inst.CancelUSSD(ctx, sessionID)
 }
 
 func (p *Pool) GetVoWiFiStatus() (enabled bool, deviceID string, status string) {
