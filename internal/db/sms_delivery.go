@@ -44,8 +44,12 @@ func (SMSDelivery) TableName() string { return "sms_delivery" }
 // SMSDeliveryPart 记录一条上行短信分片(part 级别)的发送与回执状态。
 type SMSDeliveryPart struct {
 	ID        uint       `gorm:"primaryKey" json:"id"`
-	MessageID string     `gorm:"column:message_id;index:idx_sms_delivery_part_mid_no,priority:1;index" json:"message_id"`
-	PartNo    int        `gorm:"column:part_no;index:idx_sms_delivery_part_mid_no,priority:2" json:"part_no"`
+	// (message_id, part_no) 必须是 uniqueIndex：UpsertSMSDeliveryPart 拿它当
+	// ON CONFLICT 目标，而 SQLite 只接受 PK 或 UNIQUE 索引，普通索引会让整条
+	// INSERT 直接报 "ON CONFLICT clause does not match any PRIMARY KEY or
+	// UNIQUE constraint"，上行短信一条也存不下。
+	MessageID string     `gorm:"column:message_id;uniqueIndex:idx_sms_delivery_part_mid_no,priority:1;index" json:"message_id"`
+	PartNo    int        `gorm:"column:part_no;uniqueIndex:idx_sms_delivery_part_mid_no,priority:2" json:"part_no"`
 	CallID    string     `gorm:"column:call_id;index" json:"call_id"`
 	InReplyTo string     `gorm:"column:in_reply_to;index" json:"in_reply_to"`
 	RPMR      int        `gorm:"column:rp_mr;index" json:"rp_mr"`

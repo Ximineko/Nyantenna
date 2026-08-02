@@ -143,6 +143,11 @@ func Init(dbPath string) error {
 		return err
 	}
 
+	// 必须先于 AutoMigrate：同名旧索引存在时 AutoMigrate 不会把它升级成 UNIQUE
+	if err := MigrateSMSDeliveryPartUniqueIndex(DB); err != nil {
+		return err
+	}
+
 	// 自动迁移
 	if err := DB.AutoMigrate(
 		&Device{},
