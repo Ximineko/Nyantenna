@@ -6,17 +6,37 @@ USE_PROCD=1
 
 PROG=/usr/bin/nyantenna
 CONFIG=/etc/nyantenna/config.yaml
-WORKDIR=/var/lib/nyantenna
+
+WORKDIR=/etc/nyantenna
+
+LOGDIR=/var/log/nyantenna
+
+LAUNCHER_DIR=/var/run/nyantenna
+LAUNCHER="$LAUNCHER_DIR/nyantenna"
 
 start_service() {
-	mkdir -p "$WORKDIR/data" "$WORKDIR/logs"
+	mkdir -p "$WORKDIR/data" "$LOGDIR" "$LAUNCHER_DIR"
+
+	[ -L "$WORKDIR/logs" ] || {
+		rm -rf "$WORKDIR/logs"
+		ln -s "$LOGDIR" "$WORKDIR/logs"
+	}
+
+	# 从旧的 tmpfs 位置迁移一次数据。
+	if [ ! -f "$WORKDIR/data/nyantenna.db" ] && [ ! -f "$WORKDIR/data/vohive.db" ] &&
+		[ -d /var/lib/nyantenna/data ]; then
+		cp -a /var/lib/nyantenna/data/. "$WORKDIR/data/" 2>/dev/null
+	fi
+
+	cat >"$LAUNCHER" <<EOF
+#!/bin/sh
+cd '$WORKDIR' || exit 1
+exec '$PROG' -c '$CONFIG'
+EOF
+	chmod +x "$LAUNCHER"
 
 	procd_open_instance
-	# 必须自己 cd：数据库与日志路径（data/nyantenna.db、logs/app.log）都是相对工作目录的，
-	# 而 procd 并没有 cwd 这个参数——写了会被静默忽略，进程以 / 为工作目录启动，
-	# 于是去开 /data/nyantenna.db，目录不存在，SQLite 报 CANTOPEN(14)。
-	# exec 让 sh 被替换掉，procd 仍能正确跟踪进程与 respawn。
-	procd_set_param command /bin/sh -c "cd '$WORKDIR' && exec '$PROG' -c '$CONFIG'"
+	procd_set_param command "$LAUNCHER"
 	procd_set_param respawn 3600 5 5
 	procd_set_param stdout 1
 	procd_set_param stderr 1
