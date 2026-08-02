@@ -241,7 +241,23 @@ func rewriteSelectP2(apdu []byte) []byte {
 
 // withTransaction 在事务内执行一段 APDU 序列。调用方必须已持有 c.mu：
 // c.mu 只挡住本进程内的并发，事务才挡得住其它 PC/SC 客户端。
+//
+// 读卡器句柄可能在运行中失效（USB 自动挂起、pcscd 侧复位等），此后所有调用
+// 都报 SCARD_E_INVALID_VALUE 一类错误且不会自愈。识别到这类错误时重连换新
+// 句柄后原样重试一次——LeaveCard 重连不复位卡片，已打开的逻辑通道与文件
+// 选择依旧有效，重试对调用方透明。
 func (c *Card) withTransaction(fn func() error) error {
+	err := c.transactLocked(fn)
+	if err == nil || !isStaleHandleErr(err) {
+		return err
+	}
+	if rerr := c.t.Reconnect(); rerr != nil {
+		return fmt.Errorf("句柄失效（%w），且%v", err, rerr)
+	}
+	return c.transactLocked(fn)
+}
+
+func (c *Card) transactLocked(fn func() error) error {
 	if err := c.t.BeginTransaction(); err != nil {
 		return err
 	}

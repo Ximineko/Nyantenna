@@ -16,6 +16,13 @@ type fakeTransport struct {
 	// sentOutsideTx 记录未被事务包住就发出的 APDU——这类序列会被其它
 	// PC/SC 客户端插入打断，是 SCARD_E_NOT_TRANSACTED 的根源
 	sentOutsideTx []string
+
+	// beginErr / transmitErr 注入一次性故障：命中一次后自动清除，
+	// 用于验证句柄失效 → 重连 → 重试的自愈路径。
+	beginErr     error
+	transmitErr  map[string]error
+	reconnects   int
+	reconnectErr error
 }
 
 func newFake(script map[string]string) *fakeTransport {
@@ -32,6 +39,10 @@ func (f *fakeTransport) Transmit(apdu []byte) ([]byte, error) {
 	if f.txDepth <= 0 {
 		f.sentOutsideTx = append(f.sentOutsideTx, key)
 	}
+	if err, ok := f.transmitErr[key]; ok {
+		delete(f.transmitErr, key)
+		return nil, err
+	}
 	resp, ok := f.script[key]
 	if !ok {
 		// 未编排的指令一律回 6A82（文件未找到），模拟卡的拒绝行为
@@ -44,8 +55,18 @@ func (f *fakeTransport) ATR() []byte  { return []byte{0x3B, 0x9F, 0x00, 0x01} }
 func (f *fakeTransport) Close() error { return nil }
 
 // 事务在假实现里只做计数，用于断言"多条 APDU 的序列确实被包住了"
-func (f *fakeTransport) BeginTransaction() error { f.txDepth++; f.txBegins++; return nil }
-func (f *fakeTransport) EndTransaction() error   { f.txDepth--; return nil }
+func (f *fakeTransport) BeginTransaction() error {
+	if err := f.beginErr; err != nil {
+		f.beginErr = nil
+		return err
+	}
+	f.txDepth++
+	f.txBegins++
+	return nil
+}
+func (f *fakeTransport) EndTransaction() error { f.txDepth--; return nil }
+
+func (f *fakeTransport) Reconnect() error { f.reconnects++; return f.reconnectErr }
 
 func TestClaForChannel(t *testing.T) {
 	tests := []struct {
@@ -316,6 +337,83 @@ func TestReadIMSI(t *testing.T) {
 	}
 	if imsi != "460010123456789" {
 		t.Fatalf("IMSI = %q", imsi)
+	}
+}
+
+// 句柄失效（USB 自动挂起、pcscd 侧复位等）后 BeginTransaction 就会报错，
+// 此时必须重连并重试，否则只能重启进程才能恢复。
+func TestWithTransactionReconnectsOnStaleBegin(t *testing.T) {
+	f := newFake(map[string]string{
+		"00B0000009": "0809101032547698109000",
+	})
+	f.beginErr = errStaleHandleForTest
+	card := NewCard(f, "test")
+
+	resp, err := card.TransmitAPDU(0, "00B0000009")
+	if err != nil {
+		t.Fatalf("句柄失效后应重连重试成功: %v", err)
+	}
+	if resp != "0809101032547698109000" {
+		t.Fatalf("重试结果 = %s", resp)
+	}
+	if f.reconnects != 1 {
+		t.Fatalf("应重连 1 次，实际 %d 次", f.reconnects)
+	}
+}
+
+// 句柄失效也可能在事务中途的 Transmit 上暴露，同样要重连后原样重试整个序列。
+func TestWithTransactionReconnectsOnStaleTransmit(t *testing.T) {
+	f := newFake(map[string]string{
+		"00B0000009": "0809101032547698109000",
+	})
+	f.transmitErr = map[string]error{"00B0000009": errStaleHandleForTest}
+	card := NewCard(f, "test")
+
+	resp, err := card.TransmitAPDU(0, "00B0000009")
+	if err != nil {
+		t.Fatalf("Transmit 句柄失效后应重连重试成功: %v", err)
+	}
+	if resp != "0809101032547698109000" {
+		t.Fatalf("重试结果 = %s", resp)
+	}
+	if f.reconnects != 1 {
+		t.Fatalf("应重连 1 次，实际 %d 次", f.reconnects)
+	}
+	if f.txBegins != 2 {
+		t.Fatalf("重试应重新取事务，txBegins = %d, want 2", f.txBegins)
+	}
+}
+
+// 与句柄无关的错误（如卡拒绝、协议错误）不该触发重连，避免把真实故障掩盖成重试风暴。
+func TestWithTransactionNoReconnectOnOtherErrors(t *testing.T) {
+	f := newFake(nil)
+	f.beginErr = errors.New("boom")
+	card := NewCard(f, "test")
+
+	if _, err := card.TransmitAPDU(0, "00B0000009"); err == nil {
+		t.Fatal("非句柄类错误应原样上抛")
+	}
+	if f.reconnects != 0 {
+		t.Fatalf("非句柄类错误不应重连，实际重连 %d 次", f.reconnects)
+	}
+}
+
+// 重连本身失败（读卡器被拔走等）时，错误里应同时带上原始错误与重连错误。
+func TestWithTransactionReconnectFailure(t *testing.T) {
+	f := newFake(nil)
+	f.beginErr = errStaleHandleForTest
+	f.reconnectErr = errors.New("reader gone")
+	card := NewCard(f, "test")
+
+	_, err := card.TransmitAPDU(0, "00B0000009")
+	if err == nil {
+		t.Fatal("重连失败时应报错")
+	}
+	if !errors.Is(err, errStaleHandleForTest) {
+		t.Fatalf("错误应保留原始句柄失效错误: %v", err)
+	}
+	if !strings.Contains(err.Error(), "reader gone") {
+		t.Fatalf("错误应包含重连失败原因: %v", err)
 	}
 }
 

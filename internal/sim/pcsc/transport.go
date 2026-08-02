@@ -41,6 +41,11 @@ type Transport interface {
 	BeginTransaction() error
 	// EndTransaction 释放独占访问，且不复位卡片。
 	EndTransaction() error
+	// Reconnect 在句柄失效后重建与卡的连接（对应 SCardReconnect，不复位卡片）。
+	//
+	// 句柄失效多由 USB 自动挂起、pcscd 侧复位或其它客户端 SCardReconnect 引起，
+	// 此后原句柄上的一切调用都报 SCARD_E_INVALID_VALUE 之类的错误，只有重连能恢复。
+	Reconnect() error
 	// ATR 返回复位应答，仅用于诊断（判断卡片类型/电压协商结果）。
 	ATR() []byte
 	// Close 断开与卡的连接。
@@ -60,3 +65,13 @@ type Context interface {
 // NewContext 建立 PC/SC 会话。
 // 未启用 pcsc 构建标签时固定返回 ErrPCSCUnavailable。
 func NewContext() (Context, error) { return newContext() }
+
+// errStaleHandleForTest 供无硬件的单元测试注入"句柄失效"错误，
+// 走与真实 scard 错误相同的重连重试路径。
+var errStaleHandleForTest = errors.New("pcsc: stale handle (test)")
+
+// isStaleHandleErr 判断错误是否属于"卡句柄失效"一类：这类错误不重连不会恢复，
+// 而重连后原样重试通常即可。真实分类基于 scard 错误码，见 transport_scard.go。
+func isStaleHandleErr(err error) bool {
+	return errors.Is(err, errStaleHandleForTest) || isScardStaleHandle(err)
+}

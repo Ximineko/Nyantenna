@@ -3,6 +3,7 @@
 package pcsc
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/ebfe/scard"
@@ -69,6 +70,35 @@ func (t *scardTransport) BeginTransaction() error {
 // EndTransaction 用 LeaveCard 结束：复位会让已打开的逻辑通道与文件选择全部失效。
 func (t *scardTransport) EndTransaction() error {
 	return t.card.EndTransaction(scard.LeaveCard)
+}
+
+// Reconnect 用 SCardReconnect 换取新句柄。LeaveCard：不复位卡片，
+// 已打开的逻辑通道与文件选择保持有效，上层可以原样重试失败的序列。
+func (t *scardTransport) Reconnect() error {
+	if err := t.card.Reconnect(scard.ShareShared, scard.ProtocolT0|scard.ProtocolT1, scard.LeaveCard); err != nil {
+		return fmt.Errorf("重连读卡器失败: %w", err)
+	}
+	if status, err := t.card.Status(); err == nil {
+		t.atr = append([]byte(nil), status.Atr...)
+	}
+	return nil
+}
+
+// isScardStaleHandle 识别"不重连不会恢复"的 scard 错误码。
+// 实测 ak9563 在跑一段时间后固定报 SCARD_E_INVALID_VALUE；
+// NOT_TRANSACTED 是 GET RESPONSE 同步丢失后的表现（见 card.go 顶部注释），同样只有重连能救；
+// RESET_CARD 按 PC/SC 规范本就要求以 SCardReconnect 应答。
+func isScardStaleHandle(err error) bool {
+	var se scard.Error
+	if !errors.As(err, &se) {
+		return false
+	}
+	switch se {
+	case scard.ErrInvalidValue, scard.ErrInvalidHandle, scard.ErrNotTransacted,
+		scard.ErrResetCard, scard.ErrRemovedCard, scard.ErrReaderUnavailable:
+		return true
+	}
+	return false
 }
 
 func (t *scardTransport) ATR() []byte { return t.atr }
