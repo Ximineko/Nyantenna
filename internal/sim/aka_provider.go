@@ -32,6 +32,9 @@ type ATAKAProvider struct {
 	lastSelectedApp string
 	lastPreference  string
 	lastFallback    bool
+	// heldChannels 记录本 provider 当前持有的逻辑通道号，
+	// 供残留通道清理时跳过，避免并发 AKA 之间互相误关。
+	heldChannels map[int]struct{}
 }
 
 type AKAPathProfile struct {
@@ -191,6 +194,44 @@ func validateFullAID(aid, expectedPrefix string) (string, error) {
 	return aid, nil
 }
 
+// akaCleanupChannelCandidates 是自愈时盲关的通道号范围。UICC 通常只有 3~4 个
+// 补充逻辑通道，残留通道（进程中途退出、前次 Close 失败）会把通道耗尽——
+// EC20 上表现为 UIM OPEN_LOGICAL_CHANNEL 固定返回 QMI_ERR_INTERNAL，
+// 每 31 秒重试一次也不会好，不清理只能拔插模组恢复。
+var akaCleanupChannelCandidates = []int{1, 2, 3, 4}
+
+func (d *ATAKAProvider) markChannelHeld(ch int) {
+	d.mu.Lock()
+	if d.heldChannels == nil {
+		d.heldChannels = make(map[int]struct{})
+	}
+	d.heldChannels[ch] = struct{}{}
+	d.mu.Unlock()
+}
+
+func (d *ATAKAProvider) channelHeld(ch int) bool {
+	d.mu.RLock()
+	_, held := d.heldChannels[ch]
+	d.mu.RUnlock()
+	return held
+}
+
+// closeHeldChannel 关闭本 provider 持有的逻辑通道并更新持有表。
+func (d *ATAKAProvider) closeHeldChannel(app string, ch int) {
+	if err := d.m.CloseLogicalChannel(ch); err != nil {
+		logger.Warn("关闭 "+app+" 逻辑通道失败", d.withDevice("channel", ch, "err", err)...)
+	}
+	d.mu.Lock()
+	delete(d.heldChannels, ch)
+	d.mu.Unlock()
+}
+
+// openLogicalChannelWithCandidates 打开逻辑通道；失败时先清理疑似残留的
+// 通道再用同一 AID 重试一次。
+//
+// 注意这里不做"换静态前缀 AID"的回退——部分匹配可能选错应用
+// （约定见 TestATAKAProviderUSIMOpenFailureDoesNotTryStaticFallbackAID），
+// 自愈只针对通道耗尽这一类故障。清理时跳过自己持有的通道号。
 func (d *ATAKAProvider) openLogicalChannelWithCandidates(label, app, primaryAID, primarySource string) (int, string, string, error) {
 	aid := strings.ToUpper(strings.TrimSpace(primaryAID))
 	source := strings.TrimSpace(primarySource)
@@ -199,11 +240,30 @@ func (d *ATAKAProvider) openLogicalChannelWithCandidates(label, app, primaryAID,
 	}
 	ch, err := d.m.OpenLogicalChannel(aid)
 	if err == nil {
+		d.markChannelHeld(ch)
 		return ch, aid, source, nil
 	}
-	logger.Warn(label+" 逻辑通道打开失败",
+	logger.Warn(label+" 逻辑通道打开失败，清理残留通道后重试",
 		d.withDevice("app", app, "aid", aid, "aid_source", source, "err", err)...)
-	return 0, "", "", err
+
+	for _, stale := range akaCleanupChannelCandidates {
+		if d.channelHeld(stale) {
+			continue
+		}
+		if cerr := d.m.CloseLogicalChannel(stale); cerr != nil {
+			logger.Debug("清理残留逻辑通道失败（可忽略）",
+				d.withDevice("app", app, "channel", stale, "err", cerr)...)
+		}
+	}
+
+	ch, rerr := d.m.OpenLogicalChannel(aid)
+	if rerr != nil {
+		return 0, "", "", fmt.Errorf("%w（清理残留通道后重试仍失败: %v）", err, rerr)
+	}
+	logger.Info(label+" 逻辑通道在清理残留后打开成功",
+		d.withDevice("app", app, "aid", aid, "channel", ch)...)
+	d.markChannelHeld(ch)
+	return ch, aid, source, nil
 }
 
 func (d *ATAKAProvider) calculateAKAOnUSIM(rand16, autn16 []byte) (AKAResult, error) {
@@ -217,11 +277,7 @@ func (d *ATAKAProvider) calculateAKAOnUSIM(rand16, autn16 []byte) (AKAResult, er
 		return AKAResult{}, fmt.Errorf("打开 USIM 逻辑通道失败: %w", err)
 	}
 	logger.Debug("USIM 逻辑通道已打开", d.withDevice("channel", ch, "aid", openedAID, "aid_source", openedSource)...)
-	defer func() {
-		if err := d.m.CloseLogicalChannel(ch); err != nil {
-			logger.Warn("关闭 USIM 逻辑通道失败", d.withDevice("channel", ch, "err", err)...)
-		}
-	}()
+	defer d.closeHeldChannel("USIM", ch)
 
 	apdu, err := BuildUSIMAuthAPDU(rand16, autn16, false)
 	if err != nil {
@@ -252,16 +308,12 @@ func (d *ATAKAProvider) calculateAKAOnISIMLogicalChannel(rand16, autn16 []byte) 
 		return AKAResult{}, err
 	}
 
-	ch, err := d.m.OpenLogicalChannel(isimAID)
+	ch, openedAID, openedSource, err := d.openLogicalChannelWithCandidates("ISIM", "isim", isimAID, aidSource)
 	if err != nil {
 		return AKAResult{}, fmt.Errorf("打开 ISIM 逻辑通道失败: %w", err)
 	}
-	logger.Debug("ISIM 逻辑通道已打开", d.withDevice("channel", ch, "aid", isimAID, "aid_source", aidSource)...)
-	defer func() {
-		if err := d.m.CloseLogicalChannel(ch); err != nil {
-			logger.Warn("关闭 ISIM 逻辑通道失败", d.withDevice("channel", ch, "err", err)...)
-		}
-	}()
+	logger.Debug("ISIM 逻辑通道已打开", d.withDevice("channel", ch, "aid", openedAID, "aid_source", openedSource)...)
+	defer d.closeHeldChannel("ISIM", ch)
 
 	apdu, err := BuildUSIMAuthAPDU(rand16, autn16, false)
 	if err != nil {
